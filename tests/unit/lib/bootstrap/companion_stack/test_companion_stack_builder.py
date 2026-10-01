@@ -1,4 +1,11 @@
-from samcli.lib.bootstrap.companion_stack.companion_stack_builder import CompanionStackBuilder
+import json
+
+from parameterized import parameterized
+
+from samcli.lib.bootstrap.companion_stack.companion_stack_builder import (
+    CompanionStackBuilder,
+    companion_repo_lifecycle_policy,
+)
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
@@ -91,3 +98,41 @@ class TestCompanionStackBuilder(TestCase):
                 (function_prefix + function_name, ecr_repo_instances[function_names.index(function_name)]),
                 builder.repo_mapping.items(),
             )
+
+    def _build_single_repo(self):
+        repo = Mock()
+        repo.logical_id = "RepoLogicalIDA"
+        repo.physical_id = "RepoPhysicalIDA"
+        repo.output_logical_id = "RepoOutputIDA"
+        companion_stack = Mock()
+        companion_stack.stack_name = "CompanionStackA"
+        with patch("samcli.lib.bootstrap.companion_stack.companion_stack_builder.ECRRepo", return_value=repo):
+            builder = CompanionStackBuilder(companion_stack)
+            builder.add_function("FunctionA")
+            return builder._build_repo_dict(repo)
+
+    def test_repos_get_a_keep_newest_images_lifecycle_policy_by_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            repo_dict = self._build_single_repo()
+
+        policy = json.loads(repo_dict["Properties"]["LifecyclePolicy"]["LifecyclePolicyText"])
+        selection = policy["rules"][0]["selection"]
+        self.assertEqual("tagged", selection["tagStatus"])
+        self.assertEqual(["*"], selection["tagPatternList"])
+        self.assertEqual("imageCountMoreThan", selection["countType"])
+        self.assertEqual(100, selection["countNumber"])
+        self.assertEqual({"type": "expire"}, policy["rules"][0]["action"])
+
+    @parameterized.expand([("25", 25), ("abc", 100), ("", 100)])
+    def test_lifecycle_policy_count_from_environment(self, value, expected):
+        with patch.dict("os.environ", {"SAM_CLI_COMPANION_REPO_RETAIN_IMAGES": value}, clear=True):
+            policy = json.loads(companion_repo_lifecycle_policy())
+
+        self.assertEqual(expected, policy["rules"][0]["selection"]["countNumber"])
+
+    @parameterized.expand([("0",), ("-1",)])
+    def test_lifecycle_policy_can_be_disabled(self, value):
+        with patch.dict("os.environ", {"SAM_CLI_COMPANION_REPO_RETAIN_IMAGES": value}, clear=True):
+            repo_dict = self._build_single_repo()
+
+        self.assertNotIn("LifecyclePolicy", repo_dict["Properties"])

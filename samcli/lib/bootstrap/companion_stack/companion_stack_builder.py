@@ -2,10 +2,59 @@
 Companion stack template builder
 """
 
-from typing import Dict, cast
+import json
+import logging
+import os
+from typing import Dict, Optional, cast
 
 from samcli.lib.bootstrap.companion_stack.data_types import CompanionStack, ECRRepo
 from samcli.lib.bootstrap.stack_builder import AbstractStackBuilder
+
+LOG = logging.getLogger(__name__)
+
+# montauklabs: companion-stack ECR repos get a lifecycle policy so image history does not grow
+# without bound. Every `sam deploy` updates the companion stack, so this also applies to existing
+# repos on their next deploy. Set the variable to 0 to leave repos without a policy.
+COMPANION_REPO_RETAIN_IMAGES_ENV_VAR = "SAM_CLI_COMPANION_REPO_RETAIN_IMAGES"
+DEFAULT_COMPANION_REPO_RETAIN_IMAGES = 100
+
+
+def companion_repo_lifecycle_policy() -> Optional[str]:
+    """
+    LifecyclePolicyText for companion-stack repos: keep the newest N tagged images, whatever the
+    tag name (repos can hold images tagged for another function when SAM reuses an identical
+    image, or for a function's previous name). Returns None when disabled.
+    """
+    value = os.environ.get(COMPANION_REPO_RETAIN_IMAGES_ENV_VAR)
+    count = DEFAULT_COMPANION_REPO_RETAIN_IMAGES
+    if value:
+        try:
+            count = int(value)
+        except ValueError:
+            LOG.warning(
+                "Ignoring invalid %s=%r; keeping the newest %d images",
+                COMPANION_REPO_RETAIN_IMAGES_ENV_VAR,
+                value,
+                DEFAULT_COMPANION_REPO_RETAIN_IMAGES,
+            )
+    if count <= 0:
+        return None
+    policy = {
+        "rules": [
+            {
+                "rulePriority": 1,
+                "description": f"Retain newest {count} images",
+                "selection": {
+                    "tagStatus": "tagged",
+                    "tagPatternList": ["*"],
+                    "countType": "imageCountMoreThan",
+                    "countNumber": count,
+                },
+                "action": {"type": "expire"},
+            }
+        ]
+    }
+    return json.dumps(policy, separators=(",", ":"))
 
 
 class CompanionStackBuilder(AbstractStackBuilder):
@@ -63,7 +112,7 @@ class CompanionStackBuilder(AbstractStackBuilder):
         dict
             ECR repo resource dictionary
         """
-        return {
+        repo_dict: Dict = {
             "Type": "AWS::ECR::Repository",
             "Properties": {
                 "RepositoryName": repo.physical_id,
@@ -84,6 +133,10 @@ class CompanionStackBuilder(AbstractStackBuilder):
                 },
             },
         }
+        lifecycle_policy = companion_repo_lifecycle_policy()
+        if lifecycle_policy:
+            repo_dict["Properties"]["LifecyclePolicy"] = {"LifecyclePolicyText": lifecycle_policy}
+        return repo_dict
 
     @staticmethod
     def _build_output_dict(repo: ECRRepo) -> str:
