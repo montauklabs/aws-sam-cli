@@ -767,6 +767,20 @@ class TestContainerClientBaseInit(BaseContainerClientTestCase):
         call_kwargs = mock_docker_init.call_args.kwargs
         self.assertEqual(call_kwargs["version"], override_api)
 
+    @patch("docker.DockerClient.__init__", return_value=None)
+    def test_init_uses_long_default_timeout(self, mock_docker_init):
+        with patch.dict("os.environ", {}, clear=True):
+            ConcreteContainerClient()
+
+        self.assertEqual(600, mock_docker_init.call_args.kwargs["timeout"])
+
+    @patch("docker.DockerClient.__init__", return_value=None)
+    def test_init_with_timeout_override(self, mock_docker_init):
+        with patch.dict("os.environ", {"SAM_CLI_DOCKER_TIMEOUT": "90"}, clear=True):
+            ConcreteContainerClient()
+
+        self.assertEqual(90, mock_docker_init.call_args.kwargs["timeout"])
+
 
 class TestContainerClientBaseClass(TestCase):
     """Test the ContainerClient base class methods"""

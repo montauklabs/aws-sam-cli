@@ -97,6 +97,10 @@ class ContainerClient(docker.DockerClient, ABC):
         # Specify minimum version
         self.client_params["version"] = os.environ.get(GlobalConfig.DOCKER_API_ENV_VAR, DOCKER_MIN_API_VERSION)
 
+        # montauklabs: raise the Docker client timeout so long image pushes/pulls (multi-GB Lambda
+        # images, parallel uploads) are not cut off at docker-py's 60s default.
+        self.client_params["timeout"] = int(os.environ.get("SAM_CLI_DOCKER_TIMEOUT", "600"))
+
         # Initialize DockerClient with processed parameters
         LOG.debug(f"Creating container client with parameters: {self.client_params}")
         super().__init__(**self.client_params)
