@@ -322,3 +322,36 @@ Task Breakdown
 -   \[ \] Functional Tests
 -   \[ \] Integration tests
 -   \[ \] Update documentation
+
+## Fork companion-repository retention safety
+
+The fork retains the newest 100 tagged images by default. A higher-priority rule protects
+`sam-in-use-*` tags for each Lambda function's `$LATEST`, alias primary version, and weighted
+alias version, including functions in nested stacks. Old unaliased images remain eligible for
+expiration under the existing policy.
+
+Cleanup is paused before packaging or deploying: new companion repositories are created without
+`LifecyclePolicy`, and existing companion templates have only that property removed. The CLI
+waits for the companion update to finish before proceeding. After a settled successful deployment
+(or a successful no-change deployment), complete discovery and tagging must succeed before the
+configured policy is restored. The protection inventory includes stale pins and fails closed if
+it could exceed the priority-one rule's 1,000-image reserve.
+
+Packaging failures, deployment failures/rollback, cancellation, incomplete discovery, and tagging
+failures leave cleanup paused. This preserves image availability through failure even if some
+mutable markers have moved. A failed policy restore rolls back to the paused companion template.
+Unexecuted changesets, Express deployments, and `sam sync` also leave cleanup paused; sync can
+continue changing references through code-only/watch updates. A later settled successful
+`sam deploy` restores it. `SAM_CLI_COMPANION_REPO_RETAIN_IMAGES=0` keeps retention disabled.
+
+CloudFormation's ECR provider [removes an existing lifecycle policy when the property is omitted](https://github.com/aws-cloudformation/aws-cloudformation-resource-providers-ecr/blob/master/aws-ecr-repository/src/main/java/software/amazon/ecr/repository/UpdateHandler.java).
+Its execution credentials need `ecr:GetLifecyclePolicy` and `ecr:DeleteLifecyclePolicy`, as well as
+`ecr:PutLifecyclePolicy` when restoring it. The CLI's image protection needs `ecr:DescribeImages`
+in addition to its existing discovery and tagging permissions. This change does not edit IAM.
+If pausing fails, the command aborts before packaging, deployment, or tag movement; it cannot claim
+that an inherited policy was disabled. A waiter timeout also aborts.
+
+This protocol owns policies declared in the companion template. It does not reconcile externally
+installed policies or concurrent/out-of-band image or alias changes. It also does not change the
+preexisting force-deletion of repositories removed from the local function mapping. Validation
+uses simulated AWS clients and lifecycle evaluation, not a live deployment or deletion experiment.

@@ -2,18 +2,22 @@
 Companion stack manager
 """
 
+import json
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional, Union, cast
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError, NoCredentialsError, NoRegionError
 from mypy_boto3_cloudformation.client import CloudFormationClient
-from mypy_boto3_cloudformation.type_defs import WaiterConfigTypeDef
+from mypy_boto3_cloudformation.type_defs import UpdateStackInputTypeDef, WaiterConfigTypeDef
 from mypy_boto3_s3.client import S3Client
 
 from samcli.commands.exceptions import AWSServiceClientError, RegionError
-from samcli.lib.bootstrap.companion_stack.companion_stack_builder import CompanionStackBuilder
+from samcli.lib.bootstrap.companion_stack.companion_stack_builder import (
+    CompanionStackBuilder,
+    companion_repo_lifecycle_policy,
+)
 from samcli.lib.bootstrap.companion_stack.data_types import CompanionStack, ECRRepo
 from samcli.lib.package.artifact_exporter import mktempfile
 from samcli.lib.package.s3_uploader import S3Uploader
@@ -21,8 +25,10 @@ from samcli.lib.providers.sam_function_provider import SamFunctionProvider
 from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
 from samcli.lib.utils.packagetype import IMAGE
 from samcli.lib.utils.s3 import parse_s3_url
+from samcli.yamlhelper import yaml_parse
 
 LOG = logging.getLogger(__name__)
+MAX_TEMPLATE_BODY_BYTES = 51200
 
 
 class CompanionStackManager:
@@ -100,7 +106,10 @@ class CompanionStackManager:
             return
 
         stack_name = self._companion_stack.stack_name
-        template = self._builder.build()
+        # Packaging and the application deployment may fail or be cancelled. CloudFormation
+        # removes any existing lifecycle policy when this property is omitted. Cleanup is
+        # restored only after a settled deployment has protected every live image reference.
+        template = self._builder.build(include_lifecycle_policy=False)
 
         with mktempfile() as temporary_file:
             temporary_file.write(template)
@@ -118,9 +127,14 @@ class CompanionStackManager:
 
         exists = self.does_companion_stack_exist()
         if exists:
-            self._cfn_client.update_stack(
-                StackName=stack_name, TemplateURL=template_url, Capabilities=["CAPABILITY_AUTO_EXPAND"]
-            )
+            try:
+                self._cfn_client.update_stack(
+                    StackName=stack_name, TemplateURL=template_url, Capabilities=["CAPABILITY_AUTO_EXPAND"]
+                )
+            except ClientError as ex:
+                if ex.response.get("Error", {}).get("Message") == "No updates are to be performed.":
+                    return
+                raise
             update_waiter = self._cfn_client.get_waiter("stack_update_complete")
             update_waiter.wait(StackName=stack_name, WaiterConfig=self._update_stack_waiter_config)
         else:
@@ -204,6 +218,13 @@ class CompanionStackManager:
         Deletes unreferenced repos if they exist.
         Deletes companion stack if there isn't any repo left.
         """
+        set_ecr_stack_lifecycle_policy(
+            self._companion_stack.parent_stack_name,
+            self._region_name,
+            self._s3_bucket,
+            self._s3_prefix,
+            enabled=False,
+        )
         has_repo = bool(self.get_repository_mapping())
         if self.does_companion_stack_exist():
             self.delete_unreferenced_repos()
@@ -316,3 +337,82 @@ def sync_ecr_stack(
     image_repositories.update(manager.get_repository_mapping())
     manager.sync_repos()
     return image_repositories
+
+
+def set_ecr_stack_lifecycle_policy(
+    stack_name: str,
+    region: Optional[str],
+    s3_bucket: Optional[str],
+    s3_prefix: Optional[str],
+    enabled: bool,
+    kms_key_id: Optional[str] = None,
+) -> None:
+    """Pause or restore cleanup on the existing companion stack, without changing its resources.
+
+    A missing companion stack is normal for new stacks and user-managed repositories. All other
+    failures abort the deploy. Restoring a policy must only follow complete live-image protection.
+    CloudFormation rollback of a failed restore returns to the policy-free template.
+    """
+    config = Config(region_name=region if region else None)
+    cfn = boto3.client("cloudformation", config=config)
+    companion_name = CompanionStack(stack_name).stack_name
+    try:
+        status = cfn.describe_stacks(StackName=companion_name)["Stacks"][0]["StackStatus"]
+        if status.endswith("_IN_PROGRESS"):
+            waiter_name: Literal["stack_create_complete", "stack_update_complete"] = (
+                "stack_create_complete" if status == "CREATE_IN_PROGRESS" else "stack_update_complete"
+            )
+            cfn.get_waiter(waiter_name).wait(StackName=companion_name, WaiterConfig={"Delay": 10, "MaxAttempts": 120})
+        template = cast(
+            Union[Dict, str], cfn.get_template(StackName=companion_name, TemplateStage="Original")["TemplateBody"]
+        )
+    except ClientError as ex:
+        if ex.response.get("Error", {}).get("Message") == f"Stack with id {companion_name} does not exist":
+            return
+        raise
+    if isinstance(template, str):
+        template = yaml_parse(template)
+    policy = companion_repo_lifecycle_policy() if enabled else None
+    changed = False
+    for resource in template.get("Resources", {}).values():
+        if resource.get("Type") != "AWS::ECR::Repository":
+            continue
+        properties = resource["Properties"]
+        desired = {"LifecyclePolicyText": policy} if policy else None
+        if properties.get("LifecyclePolicy") == desired:
+            continue
+        changed = True
+        if desired:
+            properties["LifecyclePolicy"] = desired
+        else:
+            properties.pop("LifecyclePolicy", None)
+    if not changed:
+        return
+
+    template_str = json.dumps(template)
+    template_args: UpdateStackInputTypeDef = {
+        "StackName": companion_name,
+        "Capabilities": ["CAPABILITY_AUTO_EXPAND"],
+        "TemplateBody": template_str,
+        "Parameters": [{"ParameterKey": key, "UsePreviousValue": True} for key in template.get("Parameters", {})],
+    }
+    if s3_bucket and len(template_str.encode("utf-8")) > MAX_TEMPLATE_BODY_BYTES:
+        s3 = boto3.client("s3", config=config)
+        uploader = S3Uploader(s3, bucket_name=s3_bucket, prefix=s3_prefix, kms_key_id=kms_key_id, no_progressbar=True)
+        with mktempfile() as temporary_file:
+            temporary_file.write(template_str)
+            temporary_file.flush()
+            parts = parse_s3_url(
+                uploader.upload_with_dedup(temporary_file.name, "template"), version_property="Version"
+            )
+        template_args.pop("TemplateBody")
+        template_args["TemplateURL"] = uploader.to_path_style_s3_url(parts["Key"], parts.get("Version"))
+    try:
+        cfn.update_stack(**template_args)
+    except ClientError as ex:
+        if ex.response.get("Error", {}).get("Message") == "No updates are to be performed.":
+            return
+        raise
+    cfn.get_waiter("stack_update_complete").wait(
+        StackName=companion_name, WaiterConfig={"Delay": 10, "MaxAttempts": 120}
+    )

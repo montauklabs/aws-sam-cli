@@ -58,6 +58,7 @@ class FakeAws:
             "images": [{"imageManifest": "{}", "imageManifestMediaType": "application/vnd.oci.image.manifest.v1+json"}]
         }
         self.ecr.put_image.side_effect = self._put_image
+        self.ecr.get_paginator.return_value.paginate.return_value = [{"imageDetails": []}]
 
     def _list_stack_resources(self, StackName):
         if StackName in self.missing_stacks:
@@ -151,7 +152,7 @@ class TestInUseProtection(TestCase):
 
         self.assertEqual(1, self._run(aws))
 
-    def test_fails_closed_but_still_tags_what_resolved(self):
+    def test_incomplete_discovery_does_not_move_previous_protection(self):
         aws = FakeAws(
             stacks={
                 COMPANION: self._companion("r1", "r2"),
@@ -173,12 +174,12 @@ class TestInUseProtection(TestCase):
         with self.assertRaises(InUseImageProtectionError) as ctx:
             self._run(aws)
 
+        self.assertEqual([], aws.put_calls)
         message = str(ctx.exception)
-        self.assertIn("3 in-use image(s)", message)
+        self.assertIn("2 in-use image(s)", message)
         self.assertIn("app-NoDigest: no resolved image digest", message)
         self.assertIn("app-Unreadable", message)
-        self.assertIn("ImageTagAlreadyExistsException", message)
-        self.assertIn(("r1", in_use_tag("Ok")), aws.tags())
+        self.assertEqual([], aws.put_calls)
 
     def test_no_companion_stack_is_a_no_op(self):
         aws = FakeAws(stacks={}, functions={}, missing_stacks=[COMPANION])
@@ -213,3 +214,108 @@ class TestHelpers(TestCase):
         self.assertEqual(("ns/repo", "sha256:abc"), parse_resolved_image_uri(f"{REGISTRY}/ns/repo@sha256:abc"))
         self.assertIsNone(parse_resolved_image_uri(f"{REGISTRY}/ns/repo:tag"))
         self.assertIsNone(parse_resolved_image_uri(None))
+
+
+class TestProtectionSafety(TestCase):
+    _run = TestInUseProtection._run
+    _companion = TestInUseProtection._companion
+
+    def test_weighted_alias_version_has_an_independent_stable_pin(self):
+        aws = FakeAws(
+            stacks={COMPANION: self._companion("r"), "app": [_resource("Fn", "AWS::Lambda::Function", "app-Fn")]},
+            functions={
+                ("app-Fn", None): _image("r", "sha256:latest"),
+                ("app-Fn", "7"): _image("r", "sha256:primary"),
+                ("app-Fn", "6"): _image("r", "sha256:weighted"),
+            },
+            aliases={
+                "app-Fn": [
+                    {"Name": "live", "FunctionVersion": "7", "RoutingConfig": {"AdditionalVersionWeights": {"6": 0.1}}}
+                ]
+            },
+        )
+        self.assertEqual(3, self._run(aws))
+        self.assertEqual("sha256:weighted", aws.tags()[("r", in_use_tag("Fn/weighted", "live"))])
+        self.assertEqual("sha256:primary", aws.tags()[("r", in_use_tag("Fn", "live"))])
+
+    def test_alias_resource_and_image_inventory_pagination(self):
+        aws = FakeAws(
+            stacks={},
+            functions={
+                ("app-Fn", None): _image("r", "sha256:latest"),
+                ("app-Fn", "7"): _image("r", "sha256:old"),
+            },
+        )
+        aws.cfn.get_paginator.return_value.paginate.side_effect = lambda StackName: {
+            COMPANION: [{"StackResourceSummaries": []}, {"StackResourceSummaries": self._companion("r")}],
+            "app": [
+                {"StackResourceSummaries": []},
+                {"StackResourceSummaries": [_resource("Child", "AWS::CloudFormation::Stack", "child")]},
+            ],
+            "child": [
+                {"StackResourceSummaries": []},
+                {"StackResourceSummaries": [_resource("Fn", "AWS::Lambda::Function", "app-Fn")]},
+            ],
+        }[StackName]
+        aws.lambda_client.get_paginator.return_value.paginate.return_value = [
+            {"Aliases": []},
+            {"Aliases": [{"Name": "live", "FunctionVersion": "7"}]},
+        ]
+        aws.lambda_client.get_paginator.return_value.paginate.side_effect = None
+        aws.ecr.get_paginator.return_value.paginate.return_value = [{"imageDetails": []}, {"imageDetails": []}]
+        self.assertEqual(2, self._run(aws))
+        self.assertIn(("r", in_use_tag("Child/Fn", "live")), aws.tags())
+
+    def test_stale_pins_cannot_overflow_the_protected_count_rule(self):
+        aws = FakeAws(
+            stacks={COMPANION: self._companion("r"), "app": [_resource("Fn", "AWS::Lambda::Function", "app-Fn")]},
+            functions={("app-Fn", None): _image("r", "sha256:live")},
+        )
+        aws.ecr.get_paginator.return_value.paginate.return_value = [
+            {
+                "imageDetails": [
+                    {"imageDigest": f"sha256:{n}", "imageTags": [f"sam-in-use-stale-{n}"]} for n in range(1000)
+                ]
+            }
+        ]
+        with self.assertRaisesRegex(InUseImageProtectionError, "1001 protected images exceed"):
+            self._run(aws)
+        self.assertEqual([], aws.put_calls)
+
+    def test_inventory_discovery_failure_does_not_move_tags(self):
+        aws = FakeAws(
+            stacks={COMPANION: self._companion("r"), "app": [_resource("Fn", "AWS::Lambda::Function", "app-Fn")]},
+            functions={("app-Fn", None): _image("r", "sha256:live")},
+        )
+        aws.ecr.get_paginator.return_value.paginate.side_effect = _client_error("AccessDenied")
+        with self.assertRaises(ClientError):
+            self._run(aws)
+        self.assertEqual([], aws.put_calls)
+
+    def test_tagging_failure_reports_failure(self):
+        aws = FakeAws(
+            stacks={COMPANION: self._companion("r"), "app": [_resource("Fn", "AWS::Lambda::Function", "app-Fn")]},
+            functions={("app-Fn", None): _image("r", "sha256:live")},
+        )
+        aws.put_errors[in_use_tag("Fn")] = _client_error("AccessDenied")
+        with self.assertRaisesRegex(InUseImageProtectionError, "AccessDenied"):
+            self._run(aws)
+
+    def test_colliding_long_alias_markers_fail_before_tagging(self):
+        aws = FakeAws(
+            stacks={COMPANION: self._companion("r"), "app": [_resource("Fn", "AWS::Lambda::Function", "app-Fn")]},
+            functions={
+                ("app-Fn", None): _image("r", "sha256:latest"),
+                ("app-Fn", "7"): _image("r", "sha256:first"),
+                ("app-Fn", "6"): _image("r", "sha256:second"),
+            },
+            aliases={
+                "app-Fn": [
+                    {"Name": "a" * 127 + "x", "FunctionVersion": "7"},
+                    {"Name": "a" * 127 + "y", "FunctionVersion": "6"},
+                ]
+            },
+        )
+        with self.assertRaisesRegex(InUseImageProtectionError, "collides across live digests"):
+            self._run(aws)
+        self.assertEqual([], aws.put_calls)

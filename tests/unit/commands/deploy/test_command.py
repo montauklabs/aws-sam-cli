@@ -26,6 +26,9 @@ MOCK_SAM_CONFIG = get_mock_sam_config()
 
 class TestDeployCliCommand(TestCase):
     def setUp(self):
+        lifecycle_patch = patch("samcli.commands.deploy.command.set_ecr_stack_lifecycle_policy")
+        self.lifecycle_mock = lifecycle_patch.start()
+        self.addCleanup(lifecycle_patch.stop)
         self.template_file = "input-template-file"
         self.stack_name = "stack-name"
         self.s3_bucket = "s3-bucket"

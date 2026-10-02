@@ -30,6 +30,7 @@ from samcli.commands.deploy.utils import (
     print_deploy_args,
     sanitize_parameter_overrides,
 )
+from samcli.lib.bootstrap.companion_stack.companion_stack_manager import set_ecr_stack_lifecycle_policy
 from samcli.lib.bootstrap.companion_stack.in_use_protection import protect_in_use_images
 from samcli.lib.cfn_language_extensions.sam_integration import resolve_language_extensions_enabled
 from samcli.lib.deploy.deployer import Deployer
@@ -278,6 +279,10 @@ class DeployContext:
         else:
             deployment_config = None
 
+        # Also covers sam sync, which can call DeployContext without do_cli's packaging guard.
+        set_ecr_stack_lifecycle_policy(
+            stack_name, region, self.s3_bucket, self.s3_prefix, enabled=False, kms_key_id=self.kms_key_id
+        )
         if use_changeset:
             try:
                 result, changeset_type = self.deployer.create_and_wait_for_changeset(
@@ -386,6 +391,10 @@ class DeployContext:
         lifecycle policy never expires them. Raises if any could not be protected.
         """
         protected = protect_in_use_images(stack_name, region, get_boto_config_with_user_agent())
+        if not self.express and self.use_changeset:
+            set_ecr_stack_lifecycle_policy(
+                stack_name, region, self.s3_bucket, self.s3_prefix, enabled=True, kms_key_id=self.kms_key_id
+            )
         if protected and self._output_mode is not OutputOption.json:
             click.echo(f"\nProtected {protected} in-use image reference(s) from companion-repo lifecycle expiry")
 

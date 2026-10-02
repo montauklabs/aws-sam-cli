@@ -6,6 +6,11 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 
 class TestCompanionStackManager(TestCase):
     def setUp(self):
+        self.lifecycle_patch = patch(
+            "samcli.lib.bootstrap.companion_stack.companion_stack_manager.set_ecr_stack_lifecycle_policy"
+        )
+        self.lifecycle_mock = self.lifecycle_patch.start()
+        self.addCleanup(self.lifecycle_patch.stop)
         self.stack_name = "StackA"
         self.companion_stack_name = "CompanionStackA"
 
@@ -62,7 +67,7 @@ class TestCompanionStackManager(TestCase):
 
         self.manager.update_companion_stack()
 
-        self.companion_stack_builder_mock.return_value.build.assert_called_once()
+        self.companion_stack_builder_mock.return_value.build.assert_called_once_with(include_lifecycle_policy=False)
         s3_uploader_mock.return_value.upload_with_dedup.assert_called_once()
         self.cfn_client.create_stack.assert_called_once_with(
             StackName=self.companion_stack_name, TemplateURL=ANY, Capabilities=ANY
@@ -86,7 +91,7 @@ class TestCompanionStackManager(TestCase):
 
         self.manager.update_companion_stack()
 
-        self.companion_stack_builder_mock.return_value.build.assert_called_once()
+        self.companion_stack_builder_mock.return_value.build.assert_called_once_with(include_lifecycle_policy=False)
         s3_uploader_mock.return_value.upload_with_dedup.assert_called_once()
         self.cfn_client.update_stack.assert_called_once_with(
             StackName=self.companion_stack_name, TemplateURL=ANY, Capabilities=ANY

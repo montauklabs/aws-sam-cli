@@ -5,15 +5,12 @@ The companion-stack lifecycle policy keeps the newest N tagged images per repo. 
 function in the Failed state if its image disappears from ECR, so an image that is still in use
 must never be expired, even after a rollback or a pinned alias leaves it behind newer pushes.
 
-After each successful deploy, this reads the image digest of every image function's $LATEST and
-every alias in the stack (nested stacks included) straight from Lambda, and moves a
-`sam-in-use-*` tag onto each digest. Rule 1 of the lifecycle policy keeps these tags, and ECR
-never lets the lower-priority count rule select an image a higher-priority rule matched. Images
-only arrive in a repo during deploys, and every deploy re-tags whatever is actually live, so the
-protection holds between deploys too. Tags are mutable in companion repos, so moving a tag clears
-the protection from the image that is no longer used.
-
-It fails closed: if any reference cannot be resolved or tagged, the deploy fails.
+Cleanup is paused before packaging/deploy. After a settled deploy, this reads every image
+function's $LATEST and aliases (including weighted versions and nested stacks) from Lambda and
+moves a `sam-in-use-*` tag onto each digest. Only complete discovery and tagging permits cleanup
+to resume. A failed or cancelled operation leaves cleanup paused, preserving images even when
+only some tags could be updated. Tags remain mutable so successful deploys can release old,
+unaliased images to the existing count rule.
 """
 
 import logging
@@ -26,6 +23,7 @@ from botocore.exceptions import ClientError
 
 from samcli.commands.exceptions import UserException
 from samcli.lib.bootstrap.companion_stack.companion_stack_builder import (
+    IN_USE_RULE_COUNT,
     IN_USE_TAG_PREFIX,
     companion_repo_retain_count,
 )
@@ -48,7 +46,7 @@ class InUseImageProtectionError(UserException):
     def __init__(self, stack_name: str, failures: List[str]) -> None:
         details = "\n".join(f"\t- {failure}" for failure in failures)
         super().__init__(
-            f"Stack {stack_name} deployed, but {len(failures)} in-use image(s) could not be protected from "
+            f"Stack {stack_name}: {len(failures)} in-use image(s) could not be protected from "
             f"the companion-repo lifecycle policy:\n{details}\n"
             "Fix the cause and redeploy, or set SAM_CLI_COMPANION_REPO_RETAIN_IMAGES=0 to disable retention."
         )
@@ -119,21 +117,30 @@ def _function_references(
         latest = lambda_client.get_function(FunctionName=function_name)
         if latest["Configuration"].get("PackageType") != "Image":
             return references, failures
-        qualifiers: List[Tuple[Optional[str], dict]] = [(None, latest)]
+        qualifiers: List[Tuple[Optional[str], dict, str]] = [(None, latest, in_use_tag(function_path))]
         for page in lambda_client.get_paginator("list_aliases").paginate(FunctionName=function_name):
             for alias in page["Aliases"]:
                 version = lambda_client.get_function(FunctionName=function_name, Qualifier=alias["FunctionVersion"])
-                qualifiers.append((alias["Name"], version))
+                qualifiers.append((alias["Name"], version, in_use_tag(function_path, alias["Name"])))
+                for weighted_version in alias.get("RoutingConfig", {}).get("AdditionalVersionWeights", {}):
+                    version = lambda_client.get_function(FunctionName=function_name, Qualifier=weighted_version)
+                    qualifiers.append(
+                        (
+                            f"{alias['Name']}-version-{weighted_version}",
+                            version,
+                            in_use_tag(f"{function_path}/weighted", alias["Name"]),
+                        )
+                    )
     except ClientError as ex:
         return references, [f"{function_name}: {ex}"]
 
-    for alias_name, response in qualifiers:
+    for alias_name, response, tag in qualifiers:
         label = f"{function_name}:{alias_name}" if alias_name else function_name
         parsed = parse_resolved_image_uri(response.get("Code", {}).get("ResolvedImageUri"))
         if parsed is None:
             failures.append(f"{label}: no resolved image digest")
             continue
-        references.append((parsed[0], parsed[1], in_use_tag(function_path, alias_name)))
+        references.append((parsed[0], parsed[1], tag))
     return references, failures
 
 
@@ -192,9 +199,33 @@ def protect_in_use_images(stack_name: str, region: Optional[str], boto_config: O
             failures.extend(function_failures)
             for repository, digest, tag in references:
                 if repository in companion_repos:
-                    wanted[(repository, tag)] = digest
+                    key = (repository, tag)
+                    if key in wanted and wanted[key] != digest:
+                        failures.append(f"{repository}: protection tag {tag} collides across live digests")
+                    else:
+                        wanted[key] = digest
 
-        # Tag everything that resolved before failing, so a partial failure still protects the rest.
+        # Do not move any existing protection markers when discovery is incomplete.
+        if failures:
+            raise InUseImageProtectionError(stack_name, sorted(failures))
+        # The priority-one rule is a finite count rule too. Include stale protection markers,
+        # not just today's references, so resuming it cannot expire a live protected image.
+        for repository in companion_repos:
+            digests = {digest for (repo, _), digest in wanted.items() if repo == repository}
+            for page in ecr_client.get_paginator("describe_images").paginate(
+                repositoryName=repository, filter={"tagStatus": "TAGGED"}
+            ):
+                digests.update(
+                    image["imageDigest"]
+                    for image in page["imageDetails"]
+                    if any(tag.startswith(IN_USE_TAG_PREFIX) for tag in image.get("imageTags", []))
+                )
+            if len(digests) > IN_USE_RULE_COUNT:
+                failures.append(
+                    f"{repository}: {len(digests)} protected images exceed the {IN_USE_RULE_COUNT} image limit"
+                )
+        if failures:
+            raise InUseImageProtectionError(stack_name, sorted(failures))
         for failure in executor.map(
             lambda item: _tag_image(ecr_client, item[0][0], item[1], item[0][1]), wanted.items()
         ):

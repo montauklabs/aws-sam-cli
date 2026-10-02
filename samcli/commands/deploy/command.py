@@ -41,7 +41,7 @@ from samcli.commands._utils.options import (
 from samcli.commands.deploy.core.command import DeployCommand
 from samcli.commands.deploy.utils import sanitize_parameter_overrides
 from samcli.lib.bootstrap.bootstrap import manage_stack, print_managed_s3_bucket_info
-from samcli.lib.bootstrap.companion_stack.companion_stack_manager import sync_ecr_stack
+from samcli.lib.bootstrap.companion_stack.companion_stack_manager import set_ecr_stack_lifecycle_policy, sync_ecr_stack
 from samcli.lib.cfn_language_extensions.sam_integration import resolve_language_extensions_enabled
 from samcli.lib.cli_validation.image_repository_validation import image_repository_validation
 from samcli.lib.telemetry.metric import track_command
@@ -375,6 +375,14 @@ def do_cli(
                 image_repositories = sync_ecr_stack(
                     template_file, stack_name, region, s3_bucket, s3_prefix, image_repositories
                 )
+        set_ecr_stack_lifecycle_policy(
+            guided_context.guided_stack_name if guided else stack_name,
+            guided_context.guided_region if guided else region,
+            guided_context.guided_s3_bucket if guided else s3_bucket,
+            guided_context.guided_s3_prefix if guided else s3_prefix,
+            enabled=False,
+            kms_key_id=kms_key_id,
+        )
         with osutils.tempfile_platform_independent() as output_template_file:
             if guided:
                 context_param_overrides = sanitize_parameter_overrides(guided_context.guided_parameter_overrides)

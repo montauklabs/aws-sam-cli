@@ -7,6 +7,8 @@ from unittest import TestCase
 from unittest.mock import ANY, patch, MagicMock, Mock
 import tempfile
 
+import pytest
+
 from samcli.lib.deploy.deployer import Deployer
 from samcli.commands.deploy.deploy_context import DeployContext
 from samcli.commands.deploy.exceptions import DeployBucketRequiredError, DeployFailedError, ChangeEmptyError
@@ -14,6 +16,12 @@ from samcli.lib.bootstrap.companion_stack.in_use_protection import InUseImagePro
 from samcli.lib.deploy.utils import FailureMode
 from samcli.commands.deploy.exceptions import DeployFailedError
 from samcli.lib.observability.util import OutputOption
+
+
+@pytest.fixture(autouse=True)
+def lifecycle_policy():
+    with patch("samcli.commands.deploy.deploy_context.set_ecr_stack_lifecycle_policy") as lifecycle:
+        yield lifecycle
 
 
 class TestSamDeployCommand(TestCase):

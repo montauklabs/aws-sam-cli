@@ -112,7 +112,7 @@ class CompanionStackBuilder(AbstractStackBuilder):
         """
         self._repo_mapping = dict()
 
-    def build(self) -> str:
+    def build(self, include_lifecycle_policy: bool = True) -> str:
         """
         Build companion stack CFN template with current functions
         Returns
@@ -121,7 +121,10 @@ class CompanionStackBuilder(AbstractStackBuilder):
             CFN template for companions stack
         """
         for _, ecr_repo in self._repo_mapping.items():
-            self.add_resource(cast(str, ecr_repo.logical_id), self._build_repo_dict(ecr_repo))
+            resource = self._build_repo_dict(ecr_repo)
+            if not include_lifecycle_policy:
+                resource["Properties"].pop("LifecyclePolicy", None)
+            self.add_resource(cast(str, ecr_repo.logical_id), resource)
             self.add_output(cast(str, ecr_repo.output_logical_id), CompanionStackBuilder._build_output_dict(ecr_repo))
 
         return super().build()

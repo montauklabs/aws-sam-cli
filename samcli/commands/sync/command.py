@@ -47,6 +47,7 @@ from samcli.commands.build.command import _get_mode_value_from_envvar
 from samcli.commands.sync.core.command import SyncCommand
 from samcli.commands.sync.sync_context import SyncContext
 from samcli.lib.bootstrap.bootstrap import manage_stack
+from samcli.lib.bootstrap.companion_stack.companion_stack_manager import set_ecr_stack_lifecycle_policy
 from samcli.lib.build.bundler import EsbuildBundlerManager
 from samcli.lib.cfn_language_extensions.sam_integration import resolve_language_extensions_enabled
 from samcli.lib.cli_validation.image_repository_validation import image_repository_validation
@@ -327,6 +328,9 @@ def do_cli(
         LOG.info(Colored().color_log(msg=SYNC_INFO_TEXT, color="yellow"), extra=dict(markup=True))
 
     s3_bucket_name = s3_bucket or manage_stack(profile=profile, region=region)
+    # Code-only and watch sync can bypass DeployContext and keep changing live references.
+    # Leave cleanup paused until a later settled sam deploy protects the final state.
+    set_ecr_stack_lifecycle_policy(stack_name, region, s3_bucket_name, s3_prefix, enabled=False, kms_key_id=kms_key_id)
 
     if dependency_layer is True:
         dependency_layer = check_enable_dependency_layer(template_file, language_extensions)

@@ -35,6 +35,9 @@ MOCK_SAM_CONFIG = get_mock_sam_config()
 
 class TestDoCli(TestCase):
     def setUp(self):
+        lifecycle_patch = patch("samcli.commands.sync.command.set_ecr_stack_lifecycle_policy")
+        self.lifecycle_mock = lifecycle_patch.start()
+        self.addCleanup(lifecycle_patch.stop)
         self.template_file = "input-template-file"
         self.stack_name = "stack-name"
         self.resource_id = []
@@ -119,6 +122,10 @@ class TestDoCli(TestCase):
         check_enable_adl_mock.return_value = auto_dependency_layer
         execute_infra_mock.return_value = infra_sync_result
 
+        timeline = Mock()
+        timeline.attach_mock(self.lifecycle_mock, "pause")
+        timeline.attach_mock(BuildContextMock, "build")
+
         do_cli(
             self.template_file,
             False,
@@ -152,6 +159,10 @@ class TestDoCli(TestCase):
             watch_exclude={},
             language_extensions=None,
         )
+
+        self.assertEqual("pause", timeline.mock_calls[0][0])
+        self.assertEqual(False, self.lifecycle_mock.call_args.kwargs["enabled"])
+        self.assertEqual(self.kms_key_id, self.lifecycle_mock.call_args.kwargs["kms_key_id"])
 
         if use_container and auto_dependency_layer:
             auto_dependency_layer = False
@@ -292,6 +303,10 @@ class TestDoCli(TestCase):
         sync_context_mock = Mock()
         SyncContextMock.return_value.__enter__.return_value = sync_context_mock
 
+        timeline = Mock()
+        timeline.attach_mock(self.lifecycle_mock, "pause")
+        timeline.attach_mock(BuildContextMock, "build")
+
         do_cli(
             self.template_file,
             False,
@@ -325,6 +340,10 @@ class TestDoCli(TestCase):
             watch_exclude={},
             language_extensions=None,
         )
+
+        self.assertEqual("pause", timeline.mock_calls[0][0])
+        self.assertEqual(False, self.lifecycle_mock.call_args.kwargs["enabled"])
+        self.assertEqual(self.kms_key_id, self.lifecycle_mock.call_args.kwargs["kms_key_id"])
 
         BuildContextMock.assert_called_with(
             resource_identifier=None,
@@ -449,6 +468,10 @@ class TestDoCli(TestCase):
 
         check_enable_adl_mock.return_value = auto_dependency_layer
 
+        timeline = Mock()
+        timeline.attach_mock(self.lifecycle_mock, "pause")
+        timeline.attach_mock(BuildContextMock, "build")
+
         do_cli(
             self.template_file,
             True,
@@ -482,6 +505,10 @@ class TestDoCli(TestCase):
             watch_exclude={},
             language_extensions=None,
         )
+
+        self.assertEqual("pause", timeline.mock_calls[0][0])
+        self.assertEqual(False, self.lifecycle_mock.call_args.kwargs["enabled"])
+        self.assertEqual(self.kms_key_id, self.lifecycle_mock.call_args.kwargs["kms_key_id"])
         execute_code_sync_mock.assert_called_once_with(
             template=self.template_file,
             build_context=build_context_mock,
