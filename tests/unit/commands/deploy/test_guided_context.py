@@ -6,6 +6,7 @@ import click
 
 from samcli.commands.deploy.exceptions import GuidedDeployFailedError
 from samcli.commands.deploy.guided_context import GuidedContext
+from samcli.lib.bootstrap.companion_stack.in_use_protection import InUseImageProtectionError
 from samcli.lib.utils.packagetype import ZIP, IMAGE
 
 
@@ -44,9 +45,41 @@ class TestGuidedContext(TestCase):
         )
         self.verify_image_mock = self.verify_image_patch.start()
 
+        self.protect_in_use_images_patch = patch("samcli.commands.deploy.guided_context.protect_in_use_images")
+        self.protect_in_use_images_mock = self.protect_in_use_images_patch.start()
+
     def tearDown(self):
         self.companion_stack_manager_patch.stop()
         self.verify_image_patch.stop()
+        self.protect_in_use_images_patch.stop()
+
+    def _prompt_image_repository(self):
+        with (
+            patch("samcli.commands.deploy.guided_context.SamFunctionProvider") as function_provider,
+            patch.object(self.gc, "prompt_create_all_repos", return_value=True),
+            patch.object(self.gc, "prompt_delete_unreferenced_repos", side_effect=lambda uris, repos: repos),
+        ):
+            function = MagicMock(packagetype=IMAGE, full_path="HelloWorldFunction")
+            function_provider.return_value.get_all.return_value = [function]
+            return self.gc.prompt_image_repository("test", [], {}, "region", "s3_b", "s3_p")
+
+    def test_prompt_image_repository_protects_in_use_images_before_updating_the_companion_stack(self):
+        calls = Mock()
+        calls.attach_mock(self.protect_in_use_images_mock, "protect")
+        calls.attach_mock(self.companion_stack_manager_mock.return_value.sync_repos, "sync_repos")
+
+        self._prompt_image_repository()
+
+        self.assertEqual(["protect", "sync_repos"], [c[0] for c in calls.mock_calls])
+        self.protect_in_use_images_mock.assert_called_once_with("test", "region", ANY, before_deploy=True)
+
+    def test_prompt_image_repository_does_not_update_the_companion_stack_if_protection_fails(self):
+        self.protect_in_use_images_mock.side_effect = InUseImageProtectionError("test", ["fn: no digest"], True)
+
+        with self.assertRaises(InUseImageProtectionError):
+            self._prompt_image_repository()
+
+        self.companion_stack_manager_mock.return_value.sync_repos.assert_not_called()
 
     @patch("samcli.commands.deploy.guided_context.get_resource_full_path_by_id")
     @patch("samcli.commands.deploy.guided_context.prompt")

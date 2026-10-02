@@ -25,6 +25,7 @@ from samcli.commands.deploy.guided_config import GuidedConfig
 from samcli.commands.deploy.utils import sanitize_parameter_overrides
 from samcli.lib.bootstrap.bootstrap import manage_stack, print_managed_s3_bucket_info
 from samcli.lib.bootstrap.companion_stack.companion_stack_manager import CompanionStackManager, sync_ecr_stack
+from samcli.lib.bootstrap.companion_stack.in_use_protection import protect_in_use_images
 from samcli.lib.config.samconfig import DEFAULT_CONFIG_FILE_NAME, DEFAULT_ENV
 from samcli.lib.intrinsic_resolver.intrinsics_symbol_table import IntrinsicsSymbolTable
 from samcli.lib.package.ecr_utils import is_ecr_url
@@ -32,6 +33,7 @@ from samcli.lib.package.image_utils import NoImageFoundException, NonLocalImageE
 from samcli.lib.providers.provider import Function, ResourceIdentifier, Stack, get_resource_full_path_by_id
 from samcli.lib.providers.sam_function_provider import SamFunctionProvider
 from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
+from samcli.lib.utils.boto_utils import get_boto_config_with_user_agent
 from samcli.lib.utils.colors import Colored
 from samcli.lib.utils.defaults import get_default_aws_region
 from samcli.lib.utils.packagetype import IMAGE
@@ -392,6 +394,10 @@ class GuidedContext:
         )
         GuidedContext.verify_images_exist_locally(self.function_provider.functions)
 
+        # montauklabs: like sync_ecr_stack, tag the images already in use before the companion-stack
+        # update installs or changes the lifecycle policy. Raises before anything changes if any of
+        # them cannot be protected.
+        protect_in_use_images(stack_name, region, get_boto_config_with_user_agent(), before_deploy=True)
         manager.sync_repos()
         return updated_repositories
 
@@ -482,8 +488,7 @@ class GuidedContext:
             return False
 
         click.echo(
-            "\t #Managed repositories will be deleted when their functions are "
-            "removed from the template and deployed"
+            "\t #Managed repositories will be deleted when their functions are removed from the template and deployed"
         )
         return (
             confirm(
@@ -521,7 +526,7 @@ class GuidedContext:
         if not unreferenced_repo_uris:
             return output_image_repositories
 
-        click.echo("\t Checking for unreferenced ECR repositories to clean-up: " f"{len(unreferenced_repo_uris)} found")
+        click.echo(f"\t Checking for unreferenced ECR repositories to clean-up: {len(unreferenced_repo_uris)} found")
         for repo_uri in unreferenced_repo_uris:
             click.echo(f"\t  {repo_uri}")
         delete_repos = confirm(
