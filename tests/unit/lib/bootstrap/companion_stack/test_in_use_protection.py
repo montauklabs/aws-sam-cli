@@ -180,6 +180,19 @@ class TestInUseProtection(TestCase):
         self.assertIn("ImageTagAlreadyExistsException", message)
         self.assertIn(("r1", in_use_tag("Ok")), aws.tags())
 
+    def test_stack_not_deployed_yet_is_a_no_op(self):
+        aws = FakeAws(stacks={COMPANION: self._companion("r")}, functions={}, missing_stacks=["app"])
+
+        self.assertEqual(0, self._run(aws))
+        aws.lambda_client.get_function.assert_not_called()
+
+    def test_error_message_names_the_stage(self):
+        before = str(InUseImageProtectionError("app", ["x"], before_deploy=True))
+        after = str(InUseImageProtectionError("app", ["x"]))
+
+        self.assertIn("Stopped before updating the companion stack for app", before)
+        self.assertIn("Stack app deployed, but", after)
+
     def test_no_companion_stack_is_a_no_op(self):
         aws = FakeAws(stacks={}, functions={}, missing_stacks=[COMPANION])
 

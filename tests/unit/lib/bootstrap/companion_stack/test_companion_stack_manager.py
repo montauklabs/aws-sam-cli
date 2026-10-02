@@ -1,5 +1,6 @@
 from botocore.exceptions import ClientError
 from samcli.lib.bootstrap.companion_stack.companion_stack_manager import CompanionStackManager, sync_ecr_stack
+from samcli.lib.bootstrap.companion_stack.in_use_protection import InUseImageProtectionError
 from unittest import TestCase
 from unittest.mock import ANY, MagicMock, Mock, patch
 
@@ -265,10 +266,11 @@ class TestCompanionStackManager(TestCase):
         with self.assertRaises(ClientError):
             self.assertFalse(self.manager.does_companion_stack_exist())
 
+    @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.protect_in_use_images")
     @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.CompanionStackManager")
     @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.SamLocalStackProvider")
     @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.SamFunctionProvider")
-    def test_sync_ecr_stack(self, function_provider_mock, stack_provider_mock, manager_mock):
+    def test_sync_ecr_stack(self, function_provider_mock, stack_provider_mock, manager_mock, protect_mock):
         image_repositories = {"Function1": "uri1"}
         stacks = MagicMock()
         stack_provider_mock.get_stacks.return_value = (stacks, None)
@@ -281,3 +283,37 @@ class TestCompanionStackManager(TestCase):
         manager_mock.return_value.sync_repos.assert_called_once_with()
 
         self.assertEqual(result, {"Function1": "uri1", "Function2": "uri2"})
+
+    @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.protect_in_use_images")
+    @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.CompanionStackManager")
+    @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.SamLocalStackProvider")
+    @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.SamFunctionProvider")
+    def test_sync_ecr_stack_protects_in_use_images_before_updating_the_companion_stack(
+        self, function_provider_mock, stack_provider_mock, manager_mock, protect_mock
+    ):
+        stack_provider_mock.get_stacks.return_value = (MagicMock(), None)
+        manager_mock.return_value.get_repository_mapping.return_value = {}
+        calls = Mock()
+        calls.attach_mock(protect_mock, "protect")
+        calls.attach_mock(manager_mock.return_value.sync_repos, "sync_repos")
+
+        sync_ecr_stack("template.yaml", "stack-name", "region", "s3-bucket", "s3-prefix", {})
+
+        self.assertEqual(["protect", "sync_repos"], [call[0] for call in calls.mock_calls])
+        protect_mock.assert_called_once_with("stack-name", "region", ANY, before_deploy=True)
+
+    @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.protect_in_use_images")
+    @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.CompanionStackManager")
+    @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.SamLocalStackProvider")
+    @patch("samcli.lib.bootstrap.companion_stack.companion_stack_manager.SamFunctionProvider")
+    def test_sync_ecr_stack_does_not_update_the_companion_stack_if_protection_fails(
+        self, function_provider_mock, stack_provider_mock, manager_mock, protect_mock
+    ):
+        stack_provider_mock.get_stacks.return_value = (MagicMock(), None)
+        manager_mock.return_value.get_repository_mapping.return_value = {}
+        protect_mock.side_effect = InUseImageProtectionError("stack-name", ["fn: no resolved image digest"], True)
+
+        with self.assertRaises(InUseImageProtectionError):
+            sync_ecr_stack("template.yaml", "stack-name", "region", "s3-bucket", "s3-prefix", {})
+
+        manager_mock.return_value.sync_repos.assert_not_called()

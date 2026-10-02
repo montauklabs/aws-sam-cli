@@ -45,10 +45,15 @@ MANIFEST_MEDIA_TYPES = [
 
 
 class InUseImageProtectionError(UserException):
-    def __init__(self, stack_name: str, failures: List[str]) -> None:
+    def __init__(self, stack_name: str, failures: List[str], before_deploy: bool = False) -> None:
         details = "\n".join(f"\t- {failure}" for failure in failures)
+        stage = (
+            f"Stopped before updating the companion stack for {stack_name}:"
+            if before_deploy
+            else f"Stack {stack_name} deployed, but"
+        )
         super().__init__(
-            f"Stack {stack_name} deployed, but {len(failures)} in-use image(s) could not be protected from "
+            f"{stage} {len(failures)} in-use image(s) could not be protected from "
             f"the companion-repo lifecycle policy:\n{details}\n"
             "Fix the cause and redeploy, or set SAM_CLI_COMPANION_REPO_RETAIN_IMAGES=0 to disable retention."
         )
@@ -164,11 +169,18 @@ def _tag_image(ecr_client, repository: str, digest: str, tag: str) -> Optional[s
     return None
 
 
-def protect_in_use_images(stack_name: str, region: Optional[str], boto_config: Optional[Config] = None) -> int:
+def protect_in_use_images(
+    stack_name: str, region: Optional[str], boto_config: Optional[Config] = None, before_deploy: bool = False
+) -> int:
     """
     Tag every image the stack's Lambda functions and aliases use so the companion-repo lifecycle
     policy keeps it. Only images in this stack's companion repos are tagged, since only those repos
     carry the policy. Returns the number of references protected.
+
+    Runs after each successful deploy, and also before the companion stack is updated
+    (`before_deploy=True`), so images already in use are tagged before a new or changed policy
+    takes effect. Without that first pass, the first deploy that installs the policy would leave
+    in-use images unprotected until it succeeds.
 
     Raises InUseImageProtectionError if any reference could not be resolved or tagged.
     """
@@ -181,7 +193,12 @@ def protect_in_use_images(stack_name: str, region: Optional[str], boto_config: O
 
     lambda_client = boto3.client("lambda", region_name=region, config=boto_config)
     ecr_client = boto3.client("ecr", region_name=region, config=boto_config)
-    functions = _stack_functions(cfn, stack_name)
+    try:
+        functions = _stack_functions(cfn, stack_name)
+    except ClientError as ex:
+        if "does not exist" in ex.response.get("Error", {}).get("Message", ""):
+            return 0  # not deployed yet, so nothing is in use
+        raise
 
     failures: List[str] = []
     wanted: Dict[Tuple[str, str], str] = {}  # (repo, tag) -> digest
@@ -202,6 +219,6 @@ def protect_in_use_images(stack_name: str, region: Optional[str], boto_config: O
                 failures.append(failure)
 
     if failures:
-        raise InUseImageProtectionError(stack_name, sorted(failures))
+        raise InUseImageProtectionError(stack_name, sorted(failures), before_deploy)
     LOG.debug("Protected %d in-use image reference(s) for %s", len(wanted), stack_name)
     return len(wanted)
