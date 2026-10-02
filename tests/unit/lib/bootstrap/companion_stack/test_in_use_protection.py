@@ -186,6 +186,25 @@ class TestInUseProtection(TestCase):
         self.assertEqual(0, self._run(aws))
         aws.lambda_client.get_function.assert_not_called()
 
+    def test_missing_nested_stack_fails_closed_and_still_tags_the_rest(self):
+        aws = FakeAws(
+            stacks={
+                COMPANION: self._companion("r"),
+                "app": [
+                    _resource("Fn", "AWS::Lambda::Function", "app-Fn"),
+                    _resource("Child", "AWS::CloudFormation::Stack", "arn:child"),
+                ],
+            },
+            functions={("app-Fn", None): _image("r", "sha256:a")},
+            missing_stacks=["arn:child"],
+        )
+
+        with self.assertRaises(InUseImageProtectionError) as ctx:
+            self._run(aws)
+
+        self.assertIn("nested stack Child (arn:child)", str(ctx.exception))
+        self.assertIn(("r", in_use_tag("Fn")), aws.tags())
+
     def test_error_message_names_the_stage(self):
         before = str(InUseImageProtectionError("app", ["x"], before_deploy=True))
         after = str(InUseImageProtectionError("app", ["x"]))

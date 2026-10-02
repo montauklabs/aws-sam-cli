@@ -96,8 +96,15 @@ def _companion_repos(cfn, stack_name: str) -> Optional[Set[str]]:
         raise
 
 
-def _stack_functions(cfn, stack_name: str, path: str = "") -> List[Tuple[str, str]]:
-    """(logical path, function name) for every Lambda function in the stack and its nested stacks."""
+def _stack_functions(
+    cfn, stack_name: str, path: str = "", failures: Optional[List[str]] = None
+) -> List[Tuple[str, str]]:
+    """
+    (logical path, function name) for every Lambda function in the stack and its nested stacks.
+    A nested stack that cannot be listed is recorded in `failures`, since functions in it may still
+    be in use; errors listing the root stack itself propagate to the caller.
+    """
+    failures = failures if failures is not None else []
     functions = []
     for resource in _stack_resources(cfn, stack_name):
         physical_id = resource.get("PhysicalResourceId")
@@ -107,7 +114,10 @@ def _stack_functions(cfn, stack_name: str, path: str = "") -> List[Tuple[str, st
         if resource["ResourceType"] == "AWS::Lambda::Function":
             functions.append((logical_path, physical_id))
         elif resource["ResourceType"] == "AWS::CloudFormation::Stack":
-            functions.extend(_stack_functions(cfn, physical_id, logical_path))
+            try:
+                functions.extend(_stack_functions(cfn, physical_id, logical_path, failures))
+            except ClientError as ex:
+                failures.append(f"nested stack {logical_path} ({physical_id}): {ex}")
     return functions
 
 
@@ -193,14 +203,15 @@ def protect_in_use_images(
 
     lambda_client = boto3.client("lambda", region_name=region, config=boto_config)
     ecr_client = boto3.client("ecr", region_name=region, config=boto_config)
+    failures: List[str] = []
     try:
-        functions = _stack_functions(cfn, stack_name)
+        functions = _stack_functions(cfn, stack_name, failures=failures)
     except ClientError as ex:
+        # Only the root stack's own lookup reaches here; nested-stack errors are in `failures`.
         if "does not exist" in ex.response.get("Error", {}).get("Message", ""):
             return 0  # not deployed yet, so nothing is in use
         raise
 
-    failures: List[str] = []
     wanted: Dict[Tuple[str, str], str] = {}  # (repo, tag) -> digest
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for references, function_failures in executor.map(
