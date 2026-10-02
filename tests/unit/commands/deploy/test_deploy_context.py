@@ -10,6 +10,7 @@ import tempfile
 from samcli.lib.deploy.deployer import Deployer
 from samcli.commands.deploy.deploy_context import DeployContext
 from samcli.commands.deploy.exceptions import DeployBucketRequiredError, DeployFailedError, ChangeEmptyError
+from samcli.lib.bootstrap.companion_stack.in_use_protection import InUseImageProtectionError
 from samcli.lib.deploy.utils import FailureMode
 from samcli.commands.deploy.exceptions import DeployFailedError
 from samcli.lib.observability.util import OutputOption
@@ -380,6 +381,121 @@ class TestSamDeployCommand(TestCase):
             self.deploy_command_context.deployer.wait_for_execute.assert_called_with(
                 ANY, "CREATE", False, FailureMode.DO_NOTHING, 1000, 60
             )
+
+
+PROTECT = "samcli.commands.deploy.deploy_context.protect_in_use_images"
+
+
+class TestDeployContextInUseImageProtection(TestCase):
+    def setUp(self):
+        self.context = DeployContext(
+            template_file="template-file",
+            stack_name="stack-name",
+            s3_bucket="s3-bucket",
+            image_repository="image-repo",
+            image_repositories=None,
+            force_upload=True,
+            no_progressbar=False,
+            s3_prefix="s3-prefix",
+            kms_key_id="kms-key-id",
+            parameter_overrides={"a": "b"},
+            capabilities="CAPABILITY_IAM",
+            no_execute_changeset=False,
+            role_arn="role-arn",
+            notification_arns=[],
+            fail_on_empty_changeset=False,
+            tags={"a": "b"},
+            region="any-aws-region",
+            profile=None,
+            confirm_changeset=False,
+            signing_profiles=None,
+            use_changeset=True,
+            disable_rollback=False,
+            poll_delay=0.5,
+            on_failure=FailureMode.DELETE,
+            max_wait_duration=60,
+        )
+
+    def _run(self):
+        with tempfile.NamedTemporaryFile(delete=False) as template_file:
+            template_file.write(b"{}")
+            template_file.flush()
+            self.context.template_file = template_file.name
+            self.context.run()
+
+    @patch(PROTECT, return_value=3)
+    @patch("boto3.Session")
+    @patch("boto3.client")
+    @patch.object(Deployer, "create_and_wait_for_changeset", MagicMock(return_value=({"Id": "test"}, "UPDATE")))
+    @patch.object(Deployer, "execute_changeset", MagicMock())
+    @patch.object(Deployer, "wait_for_execute", MagicMock())
+    def test_protects_after_a_successful_deploy(self, mock_client, mock_session, mock_protect):
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self._run()
+
+        mock_protect.assert_called_once_with("stack-name", ANY, ANY)
+        self.assertIn("Protected 3 in-use image reference(s)", stdout.getvalue())
+
+    @patch(PROTECT, return_value=0)
+    @patch("boto3.Session")
+    @patch("boto3.client")
+    @patch.object(
+        Deployer, "create_and_wait_for_changeset", MagicMock(side_effect=ChangeEmptyError(stack_name="stack-name"))
+    )
+    def test_protects_when_nothing_changed(self, mock_client, mock_session, mock_protect):
+        self._run()
+
+        mock_protect.assert_called_once()
+
+    @patch(PROTECT)
+    @patch("boto3.Session")
+    @patch("boto3.client")
+    @patch.object(Deployer, "create_and_wait_for_changeset", MagicMock(return_value=({"Id": "test"}, "UPDATE")))
+    @patch.object(Deployer, "execute_changeset", MagicMock())
+    def test_does_not_protect_when_changeset_is_not_executed(self, mock_client, mock_session, mock_protect):
+        self.context.no_execute_changeset = True
+        self._run()
+
+        mock_protect.assert_not_called()
+
+    @patch(PROTECT)
+    @patch("boto3.Session")
+    @patch("boto3.client")
+    @patch.object(Deployer, "create_and_wait_for_changeset", MagicMock(return_value=({"Id": "test"}, "UPDATE")))
+    @patch.object(Deployer, "execute_changeset", MagicMock())
+    @patch.object(Deployer, "wait_for_execute", MagicMock(side_effect=DeployFailedError("stack-name", "failed")))
+    @patch.object(Deployer, "rollback_delete_stack", MagicMock())
+    def test_does_not_protect_when_the_deploy_fails(self, mock_client, mock_session, mock_protect):
+        with self.assertRaises(DeployFailedError):
+            self._run()
+
+        mock_protect.assert_not_called()
+
+    @patch(PROTECT, side_effect=InUseImageProtectionError("stack-name", ["fn: no resolved image digest"]))
+    @patch("boto3.Session")
+    @patch("boto3.client")
+    @patch.object(Deployer, "create_and_wait_for_changeset", MagicMock(return_value=({"Id": "test"}, "UPDATE")))
+    @patch.object(Deployer, "execute_changeset", MagicMock())
+    @patch.object(Deployer, "wait_for_execute", MagicMock())
+    @patch.object(Deployer, "rollback_delete_stack", MagicMock())
+    def test_protection_failure_fails_the_deploy_without_deleting_the_stack(
+        self, mock_client, mock_session, mock_protect
+    ):
+        with self.assertRaises(InUseImageProtectionError):
+            self._run()
+
+        self.context.deployer.rollback_delete_stack.assert_not_called()
+
+    @patch(PROTECT, return_value=0)
+    @patch("boto3.Session")
+    @patch("boto3.client")
+    @patch.object(Deployer, "sync", MagicMock())
+    def test_protects_after_sync(self, mock_client, mock_session, mock_protect):
+        self.context.use_changeset = False
+        self._run()
+
+        mock_protect.assert_called_once()
 
 
 class TestDeployContextLanguageExtensions(TestCase):
