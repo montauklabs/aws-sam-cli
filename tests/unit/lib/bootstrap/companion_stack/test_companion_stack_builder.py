@@ -116,19 +116,31 @@ class TestCompanionStackBuilder(TestCase):
             repo_dict = self._build_single_repo()
 
         policy = json.loads(repo_dict["Properties"]["LifecyclePolicy"]["LifecyclePolicyText"])
-        selection = policy["rules"][0]["selection"]
+        count_rule = policy["rules"][1]
+        selection = count_rule["selection"]
+        self.assertEqual(2, count_rule["rulePriority"])
         self.assertEqual("tagged", selection["tagStatus"])
         self.assertEqual(["*"], selection["tagPatternList"])
         self.assertEqual("imageCountMoreThan", selection["countType"])
         self.assertEqual(100, selection["countNumber"])
-        self.assertEqual({"type": "expire"}, policy["rules"][0]["action"])
+        self.assertEqual({"type": "expire"}, count_rule["action"])
+
+    def test_in_use_rule_comes_before_the_count_rule(self):
+        with patch.dict("os.environ", {}, clear=True):
+            policy = json.loads(companion_repo_lifecycle_policy())
+
+        in_use_rule = policy["rules"][0]
+        self.assertEqual(1, in_use_rule["rulePriority"])
+        self.assertEqual("tagged", in_use_rule["selection"]["tagStatus"])
+        self.assertEqual(["sam-in-use-*"], in_use_rule["selection"]["tagPatternList"])
+        self.assertEqual(1000, in_use_rule["selection"]["countNumber"])
 
     @parameterized.expand([("25", 25), ("abc", 100), ("", 100)])
     def test_lifecycle_policy_count_from_environment(self, value, expected):
         with patch.dict("os.environ", {"SAM_CLI_COMPANION_REPO_RETAIN_IMAGES": value}, clear=True):
             policy = json.loads(companion_repo_lifecycle_policy())
 
-        self.assertEqual(expected, policy["rules"][0]["selection"]["countNumber"])
+        self.assertEqual(expected, policy["rules"][1]["selection"]["countNumber"])
 
     @parameterized.expand([("0",), ("-1",)])
     def test_lifecycle_policy_can_be_disabled(self, value):

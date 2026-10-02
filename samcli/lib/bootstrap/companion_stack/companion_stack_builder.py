@@ -17,13 +17,18 @@ LOG = logging.getLogger(__name__)
 # repos on their next deploy. Set the variable to 0 to leave repos without a policy.
 COMPANION_REPO_RETAIN_IMAGES_ENV_VAR = "SAM_CLI_COMPANION_REPO_RETAIN_IMAGES"
 DEFAULT_COMPANION_REPO_RETAIN_IMAGES = 100
+# Tag prefix `sam deploy` moves onto every image a Lambda function or alias currently uses (see
+# in_use_protection.py). Rule 1 matches these tags; ECR then never lets the lower-priority count
+# rule select those images. The rule's count is far above the few in-use tags a repo carries, so in
+# practice it never expires anything.
+IN_USE_TAG_PREFIX = "sam-in-use-"
+IN_USE_RULE_COUNT = 1000
 
 
-def companion_repo_lifecycle_policy() -> Optional[str]:
+def companion_repo_retain_count() -> Optional[int]:
     """
-    LifecyclePolicyText for companion-stack repos: keep the newest N tagged images, whatever the
-    tag name (repos can hold images tagged for another function when SAM reuses an identical
-    image, or for a function's previous name). Returns None when disabled.
+    Number of images each companion-stack repo keeps, from SAM_CLI_COMPANION_REPO_RETAIN_IMAGES.
+    Returns None when retention is disabled.
     """
     value = os.environ.get(COMPANION_REPO_RETAIN_IMAGES_ENV_VAR)
     count = DEFAULT_COMPANION_REPO_RETAIN_IMAGES
@@ -37,12 +42,35 @@ def companion_repo_lifecycle_policy() -> Optional[str]:
                 value,
                 DEFAULT_COMPANION_REPO_RETAIN_IMAGES,
             )
-    if count <= 0:
+    return count if count > 0 else None
+
+
+def companion_repo_lifecycle_policy() -> Optional[str]:
+    """
+    LifecyclePolicyText for companion-stack repos: keep the newest N tagged images, whatever the
+    tag name (repos can hold images tagged for another function when SAM reuses an identical
+    image, or for a function's previous name). Images that `sam deploy` tagged as in use are
+    matched by a higher-priority rule first, so the count rule never selects them. Returns None
+    when disabled.
+    """
+    count = companion_repo_retain_count()
+    if count is None:
         return None
     policy = {
         "rules": [
             {
                 "rulePriority": 1,
+                "description": "Keep images referenced by a Lambda function or alias",
+                "selection": {
+                    "tagStatus": "tagged",
+                    "tagPatternList": [f"{IN_USE_TAG_PREFIX}*"],
+                    "countType": "imageCountMoreThan",
+                    "countNumber": IN_USE_RULE_COUNT,
+                },
+                "action": {"type": "expire"},
+            },
+            {
+                "rulePriority": 2,
                 "description": f"Retain newest {count} images",
                 "selection": {
                     "tagStatus": "tagged",
@@ -51,7 +79,7 @@ def companion_repo_lifecycle_policy() -> Optional[str]:
                     "countNumber": count,
                 },
                 "action": {"type": "expire"},
-            }
+            },
         ]
     }
     return json.dumps(policy, separators=(",", ":"))

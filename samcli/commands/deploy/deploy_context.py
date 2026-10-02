@@ -30,6 +30,7 @@ from samcli.commands.deploy.utils import (
     print_deploy_args,
     sanitize_parameter_overrides,
 )
+from samcli.lib.bootstrap.companion_stack.in_use_protection import protect_in_use_images
 from samcli.lib.cfn_language_extensions.sam_integration import resolve_language_extensions_enabled
 from samcli.lib.deploy.deployer import Deployer
 from samcli.lib.deploy.utils import FailureMode
@@ -314,6 +315,7 @@ class DeployContext:
                 self.deployer.wait_for_execute(
                     stack_name, changeset_type, disable_rollback, self.on_failure, marker_time, self.max_wait_duration
                 )
+                self._protect_in_use_images(stack_name, region)
                 if self._output_mode is OutputOption.json:
                     # Carry the express flag so a consumer can tell a settled deploy from an express
                     # one whose resources may still be stabilizing (the text branch warns about this).
@@ -343,6 +345,8 @@ class DeployContext:
             except deploy_exceptions.ChangeEmptyError as ex:
                 if fail_on_empty_changeset:
                     raise
+                # Nothing changed, but re-tag anyway so a manual alias pin since the last deploy is covered.
+                self._protect_in_use_images(stack_name, region)
                 if self._output_mode is OutputOption.json:
                     click.echo(json.dumps({"type": "result", "status": "no_changes", "message": str(ex)}))
                 else:
@@ -370,10 +374,20 @@ class DeployContext:
                     deployment_config=deployment_config,
                 )
                 LOG.debug(result)
+                self._protect_in_use_images(stack_name, region)
 
             except deploy_exceptions.DeployFailedError as ex:
                 LOG.error(str(ex))
                 raise
+
+    def _protect_in_use_images(self, stack_name: str, region: Optional[str]) -> None:
+        """
+        montauklabs: tag the images the stack's functions and aliases use so the companion-repo
+        lifecycle policy never expires them. Raises if any could not be protected.
+        """
+        protected = protect_in_use_images(stack_name, region, get_boto_config_with_user_agent())
+        if protected and self._output_mode is not OutputOption.json:
+            click.echo(f"\nProtected {protected} in-use image reference(s) from companion-repo lifecycle expiry")
 
     @staticmethod
     def merge_parameters(template_dict: Dict, parameter_overrides: Dict) -> List[Dict]:
