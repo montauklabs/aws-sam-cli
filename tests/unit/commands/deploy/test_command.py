@@ -12,6 +12,7 @@ from samcli.commands.deploy.exceptions import GuidedDeployFailedError
 from samcli.commands.deploy.guided_config import GuidedConfig
 from samcli.lib.utils.packagetype import IMAGE, ZIP
 from samcli.commands.deploy.exceptions import DeployResolveS3AndS3SetError
+from samcli.lib.bootstrap.companion_stack.in_use_protection import InUseImageProtectionError
 from tests.unit.cli.test_cli_config_file import MockContext
 
 
@@ -69,8 +70,53 @@ class TestDeployCliCommand(TestCase):
         }
         self.companion_stack_manager_mock.return_value.get_unreferenced_repos.return_value = []
 
+        # In-use image protection calls AWS; keep every do_cli path in these tests offline.
+        self.protect_patches = [
+            patch("samcli.commands.deploy.command.protect_in_use_images", return_value=0),
+            patch("samcli.commands.deploy.guided_context.protect_in_use_images", return_value=0),
+        ]
+        self.protect_mock, self.guided_protect_mock = [p.start() for p in self.protect_patches]
+
     def tearDown(self):
         self.companion_stack_manager_patch.stop()
+        for protect_patch in self.protect_patches:
+            protect_patch.stop()
+
+    @patch("samcli.commands.package.package_context.PackageContext")
+    @patch("samcli.commands.deploy.deploy_context.DeployContext")
+    def test_explicit_image_repositories_protect_in_use_images_before_packaging(
+        self, mock_deploy_context, mock_package_context
+    ):
+        calls = Mock()
+        calls.attach_mock(self.protect_mock, "protect")
+        calls.attach_mock(mock_package_context.return_value.__enter__.return_value.run, "package")
+
+        self._do_cli_with(image_repository=None, image_repositories={"HelloWorldFunction": self.image_repository})
+
+        self.assertEqual(["protect", "package"], [c[0] for c in calls.mock_calls])
+        self.protect_mock.assert_called_once_with(self.stack_name, self.region, ANY, before_deploy=True)
+
+    @patch("samcli.commands.package.package_context.PackageContext")
+    @patch("samcli.commands.deploy.deploy_context.DeployContext")
+    def test_protection_failure_stops_before_packaging(self, mock_deploy_context, mock_package_context):
+        self.protect_mock.side_effect = InUseImageProtectionError(self.stack_name, ["fn: no digest"], True)
+
+        with self.assertRaises(InUseImageProtectionError):
+            self._do_cli_with(image_repository=None, image_repositories={"HelloWorldFunction": self.image_repository})
+
+        mock_package_context.return_value.__enter__.return_value.run.assert_not_called()
+        mock_deploy_context.assert_not_called()
+
+    @patch("samcli.commands.deploy.command.sync_ecr_stack", return_value={})
+    @patch("samcli.commands.package.package_context.PackageContext")
+    @patch("samcli.commands.deploy.deploy_context.DeployContext")
+    def test_resolved_image_repos_rely_on_sync_ecr_stack_for_protection(
+        self, mock_deploy_context, mock_package_context, mock_sync_ecr_stack
+    ):
+        self._do_cli_with(image_repository=None, resolve_image_repos=True)
+
+        mock_sync_ecr_stack.assert_called_once()
+        self.protect_mock.assert_not_called()
 
     @patch("os.environ", {**os.environ, "SAM_CLI_POLL_DELAY": 10})  # type: ignore
     @patch("samcli.commands.package.command.click")
