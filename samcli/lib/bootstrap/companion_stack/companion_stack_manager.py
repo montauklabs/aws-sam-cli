@@ -15,10 +15,12 @@ from mypy_boto3_s3.client import S3Client
 from samcli.commands.exceptions import AWSServiceClientError, RegionError
 from samcli.lib.bootstrap.companion_stack.companion_stack_builder import CompanionStackBuilder
 from samcli.lib.bootstrap.companion_stack.data_types import CompanionStack, ECRRepo
+from samcli.lib.bootstrap.companion_stack.in_use_protection import protect_in_use_images
 from samcli.lib.package.artifact_exporter import mktempfile
 from samcli.lib.package.s3_uploader import S3Uploader
 from samcli.lib.providers.sam_function_provider import SamFunctionProvider
 from samcli.lib.providers.sam_stack_provider import SamLocalStackProvider
+from samcli.lib.utils.boto_utils import get_boto_config_with_user_agent
 from samcli.lib.utils.packagetype import IMAGE
 from samcli.lib.utils.s3 import parse_s3_url
 
@@ -314,5 +316,9 @@ def sync_ecr_stack(
     ]
     manager.set_functions(function_logical_ids, image_repositories)
     image_repositories.update(manager.get_repository_mapping())
+    # montauklabs: tag the images already in use before the companion-stack update installs or
+    # changes the lifecycle policy, so they are protected even if this deploy later fails. Raises,
+    # and stops the deploy before anything changes, if any of them cannot be protected.
+    protect_in_use_images(stack_name, region, get_boto_config_with_user_agent(), before_deploy=True)
     manager.sync_repos()
     return image_repositories

@@ -45,10 +45,15 @@ MANIFEST_MEDIA_TYPES = [
 
 
 class InUseImageProtectionError(UserException):
-    def __init__(self, stack_name: str, failures: List[str]) -> None:
+    def __init__(self, stack_name: str, failures: List[str], before_deploy: bool = False) -> None:
         details = "\n".join(f"\t- {failure}" for failure in failures)
+        stage = (
+            f"Stopped before updating the companion stack for {stack_name}:"
+            if before_deploy
+            else f"Stack {stack_name} deployed, but"
+        )
         super().__init__(
-            f"Stack {stack_name} deployed, but {len(failures)} in-use image(s) could not be protected from "
+            f"{stage} {len(failures)} in-use image(s) could not be protected from "
             f"the companion-repo lifecycle policy:\n{details}\n"
             "Fix the cause and redeploy, or set SAM_CLI_COMPANION_REPO_RETAIN_IMAGES=0 to disable retention."
         )
@@ -91,8 +96,15 @@ def _companion_repos(cfn, stack_name: str) -> Optional[Set[str]]:
         raise
 
 
-def _stack_functions(cfn, stack_name: str, path: str = "") -> List[Tuple[str, str]]:
-    """(logical path, function name) for every Lambda function in the stack and its nested stacks."""
+def _stack_functions(
+    cfn, stack_name: str, path: str = "", failures: Optional[List[str]] = None
+) -> List[Tuple[str, str]]:
+    """
+    (logical path, function name) for every Lambda function in the stack and its nested stacks.
+    A nested stack that cannot be listed is recorded in `failures`, since functions in it may still
+    be in use; errors listing the root stack itself propagate to the caller.
+    """
+    failures = failures if failures is not None else []
     functions = []
     for resource in _stack_resources(cfn, stack_name):
         physical_id = resource.get("PhysicalResourceId")
@@ -102,7 +114,10 @@ def _stack_functions(cfn, stack_name: str, path: str = "") -> List[Tuple[str, st
         if resource["ResourceType"] == "AWS::Lambda::Function":
             functions.append((logical_path, physical_id))
         elif resource["ResourceType"] == "AWS::CloudFormation::Stack":
-            functions.extend(_stack_functions(cfn, physical_id, logical_path))
+            try:
+                functions.extend(_stack_functions(cfn, physical_id, logical_path, failures))
+            except ClientError as ex:
+                failures.append(f"nested stack {logical_path} ({physical_id}): {ex}")
     return functions
 
 
@@ -164,11 +179,18 @@ def _tag_image(ecr_client, repository: str, digest: str, tag: str) -> Optional[s
     return None
 
 
-def protect_in_use_images(stack_name: str, region: Optional[str], boto_config: Optional[Config] = None) -> int:
+def protect_in_use_images(
+    stack_name: str, region: Optional[str], boto_config: Optional[Config] = None, before_deploy: bool = False
+) -> int:
     """
     Tag every image the stack's Lambda functions and aliases use so the companion-repo lifecycle
     policy keeps it. Only images in this stack's companion repos are tagged, since only those repos
     carry the policy. Returns the number of references protected.
+
+    Runs after each successful deploy, and also before the companion stack is updated
+    (`before_deploy=True`), so images already in use are tagged before a new or changed policy
+    takes effect. Without that first pass, the first deploy that installs the policy would leave
+    in-use images unprotected until it succeeds.
 
     Raises InUseImageProtectionError if any reference could not be resolved or tagged.
     """
@@ -181,9 +203,15 @@ def protect_in_use_images(stack_name: str, region: Optional[str], boto_config: O
 
     lambda_client = boto3.client("lambda", region_name=region, config=boto_config)
     ecr_client = boto3.client("ecr", region_name=region, config=boto_config)
-    functions = _stack_functions(cfn, stack_name)
-
     failures: List[str] = []
+    try:
+        functions = _stack_functions(cfn, stack_name, failures=failures)
+    except ClientError as ex:
+        # Only the root stack's own lookup reaches here; nested-stack errors are in `failures`.
+        if "does not exist" in ex.response.get("Error", {}).get("Message", ""):
+            return 0  # not deployed yet, so nothing is in use
+        raise
+
     wanted: Dict[Tuple[str, str], str] = {}  # (repo, tag) -> digest
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         for references, function_failures in executor.map(
@@ -202,6 +230,6 @@ def protect_in_use_images(stack_name: str, region: Optional[str], boto_config: O
                 failures.append(failure)
 
     if failures:
-        raise InUseImageProtectionError(stack_name, sorted(failures))
+        raise InUseImageProtectionError(stack_name, sorted(failures), before_deploy)
     LOG.debug("Protected %d in-use image reference(s) for %s", len(wanted), stack_name)
     return len(wanted)

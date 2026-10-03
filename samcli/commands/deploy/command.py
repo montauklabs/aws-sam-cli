@@ -42,10 +42,12 @@ from samcli.commands.deploy.core.command import DeployCommand
 from samcli.commands.deploy.utils import sanitize_parameter_overrides
 from samcli.lib.bootstrap.bootstrap import manage_stack, print_managed_s3_bucket_info
 from samcli.lib.bootstrap.companion_stack.companion_stack_manager import sync_ecr_stack
+from samcli.lib.bootstrap.companion_stack.in_use_protection import protect_in_use_images
 from samcli.lib.cfn_language_extensions.sam_integration import resolve_language_extensions_enabled
 from samcli.lib.cli_validation.image_repository_validation import image_repository_validation
 from samcli.lib.telemetry.metric import track_command
 from samcli.lib.utils import osutils
+from samcli.lib.utils.boto_utils import get_boto_config_with_user_agent
 from samcli.lib.utils.version_checker import check_newer_version
 
 SHORT_HELP = "Deploy an AWS SAM application."
@@ -375,6 +377,11 @@ def do_cli(
                 image_repositories = sync_ecr_stack(
                     template_file, stack_name, region, s3_bucket, s3_prefix, image_repositories
                 )
+            else:
+                # montauklabs: sync_ecr_stack runs this pass for resolved repos. Explicit
+                # --image-repositories can still point at companion repos that carry the lifecycle
+                # policy, so tag the images already in use before anything new is pushed there.
+                protect_in_use_images(stack_name, region, get_boto_config_with_user_agent(), before_deploy=True)
         with osutils.tempfile_platform_independent() as output_template_file:
             if guided:
                 context_param_overrides = sanitize_parameter_overrides(guided_context.guided_parameter_overrides)
